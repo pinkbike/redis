@@ -168,6 +168,7 @@ struct redisCommand redisCommandTable[] = {
     {"zremrangebyrank",zremrangebyrankCommand,4,"w",0,NULL,1,1,1,0,0},
     {"zunionstore",zunionstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
     {"zinterstore",zinterstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
+    {"zdiffstore",zdiffstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
     {"zrange",zrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrangebyscore",zrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
@@ -239,8 +240,10 @@ struct redisCommand redisCommandTable[] = {
     {"publish",publishCommand,3,"pflt",0,NULL,0,0,0,0,0},
     {"watch",watchCommand,-2,"rs",0,noPreloadGetKeys,1,-1,1,0,0},
     {"unwatch",unwatchCommand,1,"rs",0,NULL,0,0,0,0,0},
-    {"restore",restoreCommand,4,"awm",0,NULL,1,1,1,0,0},
-    {"migrate",migrateCommand,6,"aw",0,NULL,0,0,0,0,0},
+    {"cluster",clusterCommand,-2,"ar",0,NULL,0,0,0,0,0},
+    {"restore",restoreCommand,-4,"awm",0,NULL,1,1,1,0,0},
+    {"migrate",migrateCommand,-6,"aw",0,NULL,0,0,0,0,0},
+    {"asking",askingCommand,1,"r",0,NULL,0,0,0,0,0},
     {"dump",dumpCommand,2,"ar",0,NULL,1,1,1,0,0},
     {"object",objectCommand,-2,"r",0,NULL,2,2,2,0,0},
     {"client",clientCommand,-2,"ar",0,NULL,0,0,0,0,0},
@@ -559,6 +562,27 @@ dictType keylistDictType = {
     dictListDestructor          /* val destructor */
 };
 
+/* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
+ * clusterNode structures. */
+dictType clusterNodesDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
+/* Migrate cache dict type. */
+dictType migrateCacheDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
 int htNeedsResize(dict *dict) {
     long long size, used;
 
@@ -627,9 +651,9 @@ void activeExpireCycle(void) {
 
     /* We can use at max REDIS_EXPIRELOOKUPS_TIME_PERC percentage of CPU time
      * per iteration. Since this function gets called with a frequency of
-     * REDIS_HZ times per second, the following is the max amount of
+     * server.hz times per second, the following is the max amount of
      * microseconds we can spend in this function. */
-    timelimit = 1000000*REDIS_EXPIRELOOKUPS_TIME_PERC/REDIS_HZ/100;
+    timelimit = 1000000*REDIS_EXPIRELOOKUPS_TIME_PERC/server.hz/100;
     if (timelimit <= 0) timelimit = 1;
 
     for (j = 0; j < server.dbnum; j++) {
@@ -762,13 +786,13 @@ int clientsCronResizeQueryBuffer(redisClient *c) {
 }
 
 void clientsCron(void) {
-    /* Make sure to process at least 1/(REDIS_HZ*10) of clients per call.
-     * Since this function is called REDIS_HZ times per second we are sure that
+    /* Make sure to process at least 1/(server.hz*10) of clients per call.
+     * Since this function is called server.hz times per second we are sure that
      * in the worst case we process all the clients in 10 seconds.
      * In normal conditions (a reasonable number of clients) we process
      * all the clients in a shorter time. */
     int numclients = listLength(server.clients);
-    int iterations = numclients/(REDIS_HZ*10);
+    int iterations = numclients/(server.hz*10);
 
     if (iterations < 50)
         iterations = (numclients < 50) ? numclients : 50;
@@ -790,7 +814,7 @@ void clientsCron(void) {
     }
 }
 
-/* This is our timer interrupt, called REDIS_HZ times per second.
+/* This is our timer interrupt, called server.hz times per second.
  * Here is where we do a number of things that need to be done asynchronously.
  * For instance:
  *
@@ -804,7 +828,7 @@ void clientsCron(void) {
  * - Replication reconnection.
  * - Many more...
  *
- * Everything directly called here will be called REDIS_HZ times per second,
+ * Everything directly called here will be called server.hz times per second,
  * so in order to throttle execution of things we want to do less frequently
  * a macro is used: run_with_period(milliseconds) { .... }
  */
@@ -970,13 +994,23 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * to detect transfer failures. */
     run_with_period(1000) replicationCron();
 
-    /* Run the sentinel timer if we are in sentinel mode. */
+    /* Run the Redis Cluster cron. */
+    run_with_period(1000) {
+        if (server.cluster_enabled) clusterCron();
+    }
+
+    /* Run the Sentinel timer if we are in sentinel mode. */
     run_with_period(100) {
         if (server.sentinel_mode) sentinelTimer();
     }
 
+    /* Cleanup expired MIGRATE cached sockets. */
+    run_with_period(1000) {
+        migrateCloseTimedoutSockets();
+    }
+
     server.cronloops++;
-    return 1000/REDIS_HZ;
+    return 1000/server.hz;
 }
 
 /* This function gets called every time Redis is entering the
@@ -1025,7 +1059,7 @@ void createSharedObjects(void) {
     shared.pong = createObject(REDIS_STRING,sdsnew("+PONG\r\n"));
     shared.queued = createObject(REDIS_STRING,sdsnew("+QUEUED\r\n"));
     shared.wrongtypeerr = createObject(REDIS_STRING,sdsnew(
-        "-ERR Operation against a key holding the wrong kind of value\r\n"));
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"));
     shared.nokeyerr = createObject(REDIS_STRING,sdsnew(
         "-ERR no such key\r\n"));
     shared.syntaxerr = createObject(REDIS_STRING,sdsnew(
@@ -1082,6 +1116,7 @@ void createSharedObjects(void) {
 
 void initServerConfig() {
     getRandomHexChars(server.runid,REDIS_RUN_ID_SIZE);
+    server.hz = REDIS_DEFAULT_HZ;
     server.runid[REDIS_RUN_ID_SIZE] = '\0';
     server.arch_bits = (sizeof(long) == 8) ? 64 : 32;
     server.port = REDIS_SERVERPORT;
@@ -1138,10 +1173,13 @@ void initServerConfig() {
     server.shutdown_asap = 0;
     server.repl_ping_slave_period = REDIS_REPL_PING_SLAVE_PERIOD;
     server.repl_timeout = REDIS_REPL_TIMEOUT;
+    server.cluster_enabled = 0;
+    server.cluster.configfile = zstrdup("nodes.conf");
     server.lua_caller = NULL;
     server.lua_time_limit = REDIS_LUA_TIME_LIMIT;
     server.lua_client = NULL;
     server.lua_timedout = 0;
+    server.migrate_cached_sockets = dictCreate(&migrateCacheDictType,NULL);
 
     updateLRUClock();
     resetServerSaveParams();
@@ -1354,6 +1392,7 @@ void initServer() {
         server.maxmemory_policy = REDIS_MAXMEMORY_NO_EVICTION;
     }
 
+    if (server.cluster_enabled) clusterInit();
     scriptingInit();
     slowlogInit();
     bioInit();
@@ -1584,6 +1623,29 @@ int processCommand(redisClient *c) {
         flagTransaction(c);
         addReplyError(c,"operation not permitted");
         return REDIS_OK;
+    }
+
+    /* If cluster is enabled, redirect here */
+    if (server.cluster_enabled &&
+                !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0)) {
+        int hashslot;
+
+        if (server.cluster.state != REDIS_CLUSTER_OK) {
+            addReplyError(c,"The cluster is down. Check with CLUSTER INFO for more information");
+            return REDIS_OK;
+        } else {
+            int ask;
+            clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,&hashslot,&ask);
+            if (n == NULL) {
+                addReplyError(c,"Multi keys request invalid in cluster");
+                return REDIS_OK;
+            } else if (n != server.cluster.myself) {
+                addReplySds(c,sdscatprintf(sdsempty(),
+                    "-%s %d %s:%d\r\n", ask ? "ASK" : "MOVED",
+                    hashslot,n->ip,n->port));
+                return REDIS_OK;
+            }
+        }
     }
 
     /* Handle the maxmemory directive.
@@ -1858,7 +1920,8 @@ sds genRedisInfoString(char *section) {
         struct utsname name;
         char *mode;
 
-        if (server.sentinel_mode) mode = "sentinel";
+        if (server.cluster_enabled) mode = "cluster";
+        else if (server.sentinel_mode) mode = "sentinel";
         else mode = "standalone";
     
         if (sections++) info = sdscat(info,"\r\n");
@@ -1868,6 +1931,7 @@ sds genRedisInfoString(char *section) {
             "redis_version:%s\r\n"
             "redis_git_sha1:%s\r\n"
             "redis_git_dirty:%d\r\n"
+            "redis_build_id:%llx\r\n"
             "redis_mode:%s\r\n"
             "os:%s %s %s\r\n"
             "arch_bits:%d\r\n"
@@ -1878,10 +1942,12 @@ sds genRedisInfoString(char *section) {
             "tcp_port:%d\r\n"
             "uptime_in_seconds:%ld\r\n"
             "uptime_in_days:%ld\r\n"
+            "hz:%d\r\n"
             "lru_clock:%ld\r\n",
             REDIS_VERSION,
             redisGitSHA1(),
             strtol(redisGitDirty(),NULL,10) > 0,
+            redisBuildId(),
             mode,
             name.sysname, name.release, name.machine,
             server.arch_bits,
@@ -1896,6 +1962,7 @@ sds genRedisInfoString(char *section) {
             server.port,
             uptime,
             uptime/(3600*24),
+            server.hz,
             (unsigned long) server.lruclock);
     }
 
@@ -2041,7 +2108,8 @@ sds genRedisInfoString(char *section) {
             "keyspace_misses:%lld\r\n"
             "pubsub_channels:%ld\r\n"
             "pubsub_patterns:%lu\r\n"
-            "latest_fork_usec:%lld\r\n",
+            "latest_fork_usec:%lld\r\n"
+            "migrate_cached_sockets:%ld\r\n",
             server.stat_numconnections,
             server.stat_numcommands,
             getOperationsPerSecond(),
@@ -2052,7 +2120,8 @@ sds genRedisInfoString(char *section) {
             server.stat_keyspace_misses,
             dictSize(server.pubsub_channels),
             listLength(server.pubsub_patterns),
-            server.stat_fork_time);
+            server.stat_fork_time,
+            dictSize(server.migrate_cached_sockets));
     }
 
     /* Replication */
@@ -2164,6 +2233,15 @@ sds genRedisInfoString(char *section) {
                 c->name, c->calls, c->microseconds,
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
         }
+    }
+
+    /* Cluster */
+    if (allsections || defsections || !strcasecmp(section,"cluster")) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+        "# Cluster\r\n"
+        "cluster_enabled:%d\r\n",
+        server.cluster_enabled);
     }
 
     /* Key space */
@@ -2417,12 +2495,13 @@ void daemonize(void) {
 }
 
 void version() {
-    printf("Redis server v=%s sha=%s:%d malloc=%s bits=%d\n",
+    printf("Redis server v=%s sha=%s:%d malloc=%s bits=%d build=%llx\n",
         REDIS_VERSION,
         redisGitSHA1(),
         atoi(redisGitDirty()) > 0,
         ZMALLOC_LIB,
-        sizeof(long) == 4 ? 32 : 64);
+        sizeof(long) == 4 ? 32 : 64,
+        redisBuildId());
     exit(0);
 }
 
@@ -2448,7 +2527,8 @@ void redisAsciiArt(void) {
     char *buf = zmalloc(1024*16);
     char *mode = "stand alone";
 
-    if (server.sentinel_mode) mode = "sentinel";
+    if (server.cluster_enabled) mode = "cluster";
+    else if (server.sentinel_mode) mode = "sentinel";
 
     snprintf(buf,1024*16,ascii_logo,
         REDIS_VERSION,
